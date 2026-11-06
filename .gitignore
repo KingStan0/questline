@@ -1,0 +1,42 @@
+# Dependencies and build output
+node_modules/
+dist/
+release/
+tmp/
+
+# Local/reference material (never publish)
+source/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.token
+*.secret
+.npmrc
+.yarnrc
+.yarnrc.yml
+
+# Local app state and caches
+questline-state.json
+gamelist-cache.json
+*.local
+*.user
+*.suo
+*.tsbuildinfo
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*

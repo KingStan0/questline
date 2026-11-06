@@ -1,0 +1,83 @@
+{
+  "name": "questline",
+  "productName": "Questline",
+  "version": "1.0.0",
+  "description": "A desktop companion for completing Discord quests without installing the full game.",
+  "main": "electron/main.mjs",
+  "type": "module",
+  "license": "MIT",
+  "author": "Ibrahim Chowdhury (https://github.com/ibrahimarchive)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ibrahimarchive/questline.git"
+  },
+  "homepage": "https://github.com/ibrahimarchive/questline",
+  "bugs": {
+    "url": "https://github.com/ibrahimarchive/questline/issues"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "start": "node scripts/dev.mjs",
+    "build": "vue-tsc --noEmit && vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "preview": "npm run build && electron .",
+    "screenshot": "npm run build && node scripts/screenshot.mjs",
+    "runner:build": "node scripts/build-runner.mjs",
+    "icon:build": "electron tools/icon",
+    "test:runner": "node scripts/test-runner.mjs",
+    "test:ui": "npm run build && node scripts/smoke-ui.mjs",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder --win portable"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.10",
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0",
+    "typescript": "~5.9.3",
+    "vite": "^8.3.6",
+    "vue": "^3.5.45",
+    "vue-tsc": "^3.3.14"
+  },
+  "build": {
+    "appId": "dev.questline.app",
+    "productName": "Questline",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json",
+      "LICENSE"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/runner.exe",
+        "to": "runner.exe"
+      },
+      {
+        "from": "resources/gamelist.json",
+        "to": "gamelist.json"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "portable": {
+      "artifactName": "Questline-${version}-portable.exe"
+    }
+  }
+}

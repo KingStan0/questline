@@ -1,0 +1,6 @@
+{
+  "name": "questline-icon-builder",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs"
+}
