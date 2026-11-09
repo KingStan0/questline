@@ -18,13 +18,16 @@ import {
 } from '@/store'
 import type { GameExecutable } from '@/types'
 import {
+  canonicalExecutableName,
   classNames,
   currentPlatform,
   elapsedFormat,
   formatDuration,
+  isExecutableForCurrentPlatform,
   isUsableExecutable,
   normalizePlatform,
   preferredExecutable,
+  sessionKeyFor,
   splitExecutable,
 } from '@/utils'
 
@@ -32,7 +35,9 @@ const game = selectedGame
 const wantsRpc = ref(false)
 
 const usableExecutables = computed(() =>
-  (game.value?.executables || []).filter(isUsableExecutable),
+  (game.value?.executables || []).filter(
+    (executable) => isUsableExecutable(executable) && isExecutableForCurrentPlatform(executable),
+  ),
 )
 
 const platform = currentPlatform()
@@ -57,7 +62,8 @@ const activeExecutable = computed(() => {
   if (runningSession.value) {
     const match = usableExecutables.value.find(
       (executable) =>
-        executable.name.toLowerCase() === runningSession.value!.executableName.toLowerCase(),
+        canonicalExecutableName(executable.name) ===
+        canonicalExecutableName(runningSession.value!.executableName),
     )
     if (match) return match
   }
@@ -70,7 +76,7 @@ const installed = computed(() => (game.value ? gameInstalled(game.value.id) : fa
 
 const primaryBusy = computed(() => {
   if (!game.value || !preferred.value) return false
-  return state.busyKey === `${game.value.id}::${preferred.value.name}`
+  return state.busyKey === sessionKeyFor(game.value.id, preferred.value.name)
 })
 
 const anyBusy = computed(() => Boolean(game.value && state.busyKey.startsWith(`${game.value.id}::`)))
@@ -109,7 +115,7 @@ const pathLabel = computed(() => {
 
 function isTheBusyExe(executable: GameExecutable) {
   if (!game.value) return false
-  return state.busyKey === `${game.value.id}::${executable.name}`
+  return state.busyKey === sessionKeyFor(game.value.id, executable.name)
 }
 
 function executableActionLabel(executable: GameExecutable) {

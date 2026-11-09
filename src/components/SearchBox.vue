@@ -5,6 +5,7 @@ import Icon from './Icon.vue'
 import {
   addToLibrary,
   closeSearch,
+  flushSearch,
   openSearch,
   setQuery,
   state,
@@ -49,6 +50,16 @@ function handleKeydown(event: KeyboardEvent) {
     return
   }
 
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    const wasPending = flushSearch()
+    if (!results.value.length) return
+    if (wasPending) activeIndex.value = 0
+    activeIndex.value = Math.min(activeIndex.value, results.value.length - 1)
+    choose(results.value[activeIndex.value])
+    return
+  }
+
   if (!results.value.length) return
 
   if (event.key === 'ArrowDown') {
@@ -59,9 +70,6 @@ function handleKeydown(event: KeyboardEvent) {
     event.preventDefault()
     activeIndex.value = (activeIndex.value - 1 + results.value.length) % results.value.length
     scrollActiveIntoView()
-  } else if (event.key === 'Enter') {
-    event.preventDefault()
-    choose(results.value[activeIndex.value])
   }
 }
 

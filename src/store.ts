@@ -1,4 +1,4 @@
-import { computed, reactive } from 'vue'
+import { computed, reactive, shallowRef } from 'vue'
 import type {
   AppInfo,
   Game,
@@ -21,8 +21,10 @@ import {
   currentPlatform,
   executableLabel,
   formatNumber,
+  isExecutableForCurrentPlatform,
   isUsableExecutable,
   preferredExecutable,
+  sessionKeyFor,
 } from './utils'
 
 const SUGGESTION_IDS = [
@@ -121,9 +123,10 @@ export const state = reactive<AppState>({
   toasts: [],
 })
 
-let gameIndex = new Map<string, Game>()
+let gameIndex = shallowRef<Map<string, Game>>(new Map())
 let searchIndex: SearchEntry[] = []
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+let pendingSearchGeneration = 0
 let searchGeneration = 0
 let persistTimer: ReturnType<typeof setTimeout> | null = null
 let saveChain: Promise<unknown> = Promise.resolve()
@@ -137,17 +140,17 @@ let lastSessionPoll = 0
 
 export const selectedGame = computed(() => {
   if (!state.selectedId) return null
-  return gameIndex.get(state.selectedId) || null
+  return gameIndex.value.get(state.selectedId) || null
 })
 
 export const libraryGames = computed(() =>
-  state.library.map((id) => gameIndex.get(id)).filter((game): game is Game => Boolean(game)),
+  state.library.map((id) => gameIndex.value.get(id)).filter((game): game is Game => Boolean(game)),
 )
 
 export const suggestedGames = computed(() => {
   const result: Game[] = []
   for (const id of SUGGESTION_IDS) {
-    const game = gameIndex.get(id)
+    const game = gameIndex.value.get(id)
     if (game) result.push(game)
   }
   return result.slice(0, 6)
@@ -214,7 +217,7 @@ export function elapsedFor(session: Session): number {
 }
 
 export function libraryGameFor(gameId: string): Game | null {
-  return gameIndex.get(gameId) || null
+  return gameIndex.value.get(gameId) || null
 }
 
 export function setPage(page: Page) {
@@ -248,7 +251,7 @@ function normalizeSearchText(value: string): string {
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[™®©]/g, '')
-    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim()
 }
 
@@ -321,10 +324,26 @@ export function setQuery(value: string, immediate = false) {
 
   if (searchTimer) clearTimeout(searchTimer)
   const generation = ++searchGeneration
+  pendingSearchGeneration = generation
   const run = () => runSearch(value, generation)
 
-  if (immediate) run()
-  else searchTimer = setTimeout(run, 90)
+  if (immediate) {
+    searchTimer = null
+    run()
+  } else {
+    searchTimer = setTimeout(() => {
+      searchTimer = null
+      run()
+    }, 90)
+  }
+}
+
+export function flushSearch(): boolean {
+  if (!searchTimer) return false
+  clearTimeout(searchTimer)
+  searchTimer = null
+  runSearch(state.query, pendingSearchGeneration)
+  return true
 }
 
 function runSearch(rawQuery: string, generation: number) {
@@ -368,11 +387,10 @@ function resetGameData(data: GameData) {
   state.source = data.source
   state.updatedAt = data.updatedAt
   state.cached = data.cached
-  gameIndex = new Map(data.games.map((game) => [game.id, game]))
+  gameIndex.value = new Map(data.games.map((game) => [game.id, game]))
   buildSearchIndex(data.games)
-  state.library = state.library.filter((id) => gameIndex.has(id))
-  if (state.selectedId && !state.library.includes(state.selectedId)) {
-    state.selectedId = state.library[0] || null
+  if (state.selectedId && !gameIndex.value.has(state.selectedId)) {
+    state.selectedId = state.library.find((id) => gameIndex.value.has(id)) || null
   }
 }
 
@@ -430,15 +448,14 @@ export async function initialize(force = false) {
     applyTheme()
     resetGameData(dataResult)
 
-    if (!state.library.length) {
+    const firstAvailable = state.library.find((id) => gameIndex.value.has(id)) || null
+    if (!firstAvailable) {
       state.selectedId = null
-    } else if (!state.selectedId) {
-      state.selectedId = state.library[0]
+    } else if (!state.selectedId || !gameIndex.value.has(state.selectedId)) {
+      state.selectedId = firstAvailable
     }
 
     state.appInfo = appInfoResult
-    state.ready = true
-    state.booting = false
 
     if (!state.logs.length) {
       addLog('info', `Questline ready with ${formatNumber(dataResult.games.length)} games.`)
@@ -446,7 +463,10 @@ export async function initialize(force = false) {
       addLog('info', 'Questline started.')
     }
 
+    state.bootStep = 'Checking running sessions...'
     await Promise.all([inspectLibrary(), refreshSessions(), refreshDiscordStatus()])
+    state.ready = true
+    state.booting = false
 
     const age = dataResult.updatedAt ? Date.now() - new Date(dataResult.updatedAt).getTime() : Infinity
     if (state.settings.autoRefresh && (!dataResult.cached || age > 12 * 60 * 60 * 1000)) {
@@ -508,7 +528,7 @@ export async function refreshSessions(silent = false) {
     const sessions = await window.questline.listRunning()
     state.sessions = sessions.map((session) => ({
       ...session,
-      gameName: session.gameName || gameIndex.get(session.gameId)?.name || null,
+      gameName: session.gameName || gameIndex.value.get(session.gameId)?.name || null,
     }))
   } catch (error) {
     if (!silent) {
@@ -518,7 +538,11 @@ export async function refreshSessions(silent = false) {
 }
 
 export async function inspectLibrary() {
-  const games = libraryGames.value.filter((game) => game.executables.length > 0)
+  const games = libraryGames.value.filter((game) =>
+    game.executables.some(
+      (executable) => isUsableExecutable(executable) && isExecutableForCurrentPlatform(executable),
+    ),
+  )
   if (!games.length) {
     state.inspect = {}
     state.inspecting = false
@@ -531,7 +555,10 @@ export async function inspectLibrary() {
     const result = await window.questline.inspectGames({
       games: games.map((game) => ({
         gameId: game.id,
-        executables: game.executables,
+        executables: game.executables.filter(
+          (executable) =>
+            isUsableExecutable(executable) && isExecutableForCurrentPlatform(executable),
+        ),
       })),
     })
     if (generation !== inspectGeneration) return
@@ -646,7 +673,7 @@ export function persistNow(): Promise<unknown> {
 
 export async function startGame(game: Game, executable?: GameExecutable) {
   const target = executable || preferredExecutable(game)
-  if (!target || !isUsableExecutable(target)) {
+  if (!target || !isUsableExecutable(target) || !isExecutableForCurrentPlatform(target)) {
     pushToast('error', 'No executable', `${game.name} has no usable executable registered.`)
     return
   }
@@ -656,7 +683,7 @@ export async function startGame(game: Game, executable?: GameExecutable) {
     return
   }
 
-  state.busyKey = `${game.id}::${target.name}`
+  state.busyKey = sessionKeyFor(game.id, target.name)
   const installed = executableStatus(game.id, target)?.installed
   addLog(
     'info',
@@ -702,25 +729,28 @@ export async function startGame(game: Game, executable?: GameExecutable) {
 export async function stopGame(game: Game, executable?: GameExecutable) {
   const target = executable || preferredExecutable(game)
   if (!target) return
-  const key = `${game.id}::${target.name}`
+  const key = sessionKeyFor(game.id, target.name)
   state.busyKey = key
   try {
     const result = await window.questline.stopGame({
       gameId: game.id,
       executableName: target.name,
     })
-    state.sessions = state.sessions.filter(
-      (session) =>
-        !(session.gameId === game.id && session.executableName.toLowerCase() === target.name.toLowerCase()),
-    )
-    addLog('info', `Stopped ${game.name}.`, game.id)
-    pushToast(
-      result.stopped > 0 ? 'success' : 'info',
-      result.stopped > 0 ? 'Session stopped' : 'Nothing to stop',
-      result.stopped > 0
-        ? `${game.name} is no longer visible to Discord.`
-        : `${game.name} was not running.`,
-    )
+    if (result.stopped > 0) {
+      state.sessions = state.sessions.filter((session) => session.key !== key)
+      addLog('info', `Stopped ${game.name}.`, game.id)
+      pushToast('success', 'Session stopped', `${game.name} is no longer visible to Discord.`)
+    } else {
+      await refreshSessions(true)
+      const stillRunning = state.sessions.some((session) => session.key === key)
+      if (stillRunning) {
+        addLog('warning', `${game.name} is still running.`, game.id)
+        pushToast('warning', 'Could not stop game', `${game.name} is still running.`)
+      } else {
+        addLog('info', `${game.name} was not running.`, game.id)
+        pushToast('info', 'Nothing to stop', `${game.name} was not running.`)
+      }
+    }
     await inspectLibrary()
   } catch (error) {
     const message = error instanceof Error ? error.message : 'The session could not be stopped.'
@@ -732,27 +762,29 @@ export async function stopGame(game: Game, executable?: GameExecutable) {
 }
 
 export async function stopSession(session: Session) {
-  const game = gameIndex.get(session.gameId)
+  const game = gameIndex.value.get(session.gameId)
   const name = game?.name || session.gameName || 'Game'
-  state.busyKey = `${session.gameId}::${session.executableName}`
+  state.busyKey = session.key
   try {
     const result = await window.questline.stopGame({
       gameId: session.gameId,
       executableName: session.executableName,
     })
-    state.sessions = state.sessions.filter((row) => row.key !== session.key)
-    addLog(
-      result.stopped > 0 ? 'info' : 'warning',
-      result.stopped > 0 ? `Stopped ${name}.` : `${name} was not running.`,
-      session.gameId,
-    )
-    pushToast(
-      result.stopped > 0 ? 'success' : 'info',
-      result.stopped > 0 ? 'Session stopped' : 'Nothing to stop',
-      result.stopped > 0
-        ? `${name} is no longer visible to Discord.`
-        : `${name} was not running.`,
-    )
+    if (result.stopped > 0) {
+      state.sessions = state.sessions.filter((row) => row.key !== session.key)
+      addLog('info', `Stopped ${name}.`, session.gameId)
+      pushToast('success', 'Session stopped', `${name} is no longer visible to Discord.`)
+    } else {
+      await refreshSessions(true)
+      const stillRunning = state.sessions.some((row) => row.key === session.key)
+      if (stillRunning) {
+        addLog('warning', `${name} is still running.`, session.gameId)
+        pushToast('warning', 'Could not stop session', `${name} is still running.`)
+      } else {
+        addLog('info', `${name} was not running.`, session.gameId)
+        pushToast('info', 'Nothing to stop', `${name} was not running.`)
+      }
+    }
     await inspectLibrary()
   } catch (error) {
     const message = error instanceof Error ? error.message : 'The session could not be stopped.'
@@ -768,16 +800,42 @@ export async function stopAllSessions() {
     pushToast('info', 'No active sessions', 'There is nothing running right now.')
     return
   }
+  state.busyKey = 'all'
   try {
     const result = await window.questline.stopAll()
-    state.sessions = []
-    addLog('info', `Stopped ${result.stopped} active session${result.stopped === 1 ? '' : 's'}.`)
-    pushToast('success', 'All sessions stopped', 'Discord no longer sees any fake games.')
+    await refreshSessions(true)
+    const remaining = state.sessions.length
+
+    if (result.stopped > 0) {
+      if (remaining > 0) {
+        addLog(
+          'warning',
+          `Stopped ${result.stopped} session${result.stopped === 1 ? '' : 's'}; ${remaining} still running.`,
+        )
+        pushToast(
+          'warning',
+          'Some sessions remain',
+          `${remaining} session${remaining === 1 ? ' is' : 's are'} still running.`,
+        )
+      } else {
+        addLog('info', `Stopped ${result.stopped} active session${result.stopped === 1 ? '' : 's'}.`)
+        pushToast('success', 'All sessions stopped', 'Discord no longer sees any fake games.')
+      }
+    } else if (remaining > 0) {
+      addLog('warning', 'The active sessions could not be stopped.')
+      pushToast('warning', 'Could not stop sessions', 'The runners are still active.')
+    } else {
+      addLog('info', 'No active sessions were found.')
+      pushToast('info', 'No sessions found', 'There is nothing running right now.')
+    }
+
     await inspectLibrary()
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Sessions could not be stopped.'
     addLog('error', message)
     pushToast('error', 'Could not stop sessions', message)
+  } finally {
+    state.busyKey = ''
   }
 }
 

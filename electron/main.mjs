@@ -11,7 +11,7 @@ import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 import { discordRpc } from './discord-rpc.mjs'
@@ -38,8 +38,14 @@ let mainWindow = null
 let state = null
 let statePath = null
 let runnerService = null
-let quittingAfterCleanup = false
+let cleanupComplete = false
+let cleanupStarted = false
+let saveQueue = Promise.resolve()
+let saveSequence = 0
 let discordStatusCache = { online: false, checkedAt: 0 }
+
+const appEntryPath = path.join(projectRoot, 'dist', 'index.html')
+const appEntryUrl = pathToFileURL(appEntryPath).href
 
 function currentTheme() {
   return ['dark', 'light', 'system'].includes(state?.settings?.theme)
@@ -95,8 +101,8 @@ function publicState() {
   }
 }
 
-function sanitiseSettings(input) {
-  const next = { ...state.settings }
+function sanitiseSettings(input, base = state.settings) {
+  const next = { ...base }
   if (!input || typeof input !== 'object') return next
 
   if (typeof input.gamesDirectory === 'string' && input.gamesDirectory.trim()) {
@@ -130,7 +136,7 @@ function sanitiseLogs(input) {
         typeof entry.message === 'string' &&
         ['info', 'success', 'warning', 'error'].includes(entry.type),
     )
-    .slice(-300)
+    .slice(0, 300)
     .map((entry) => ({
       id: String(entry.id || `${Date.now()}-${Math.random()}`),
       type: entry.type,
@@ -149,10 +155,8 @@ async function loadState() {
     parsed = null
   }
 
-  const settings = { ...DEFAULT_SETTINGS, ...(parsed?.settings || {}) }
+  const settings = sanitiseSettings(parsed?.settings, DEFAULT_SETTINGS)
   if (!settings.gamesDirectory) settings.gamesDirectory = defaultGamesDirectory()
-  if (!['dark', 'light', 'system'].includes(settings.theme)) settings.theme = 'dark'
-  settings.gamesDirectory = path.resolve(settings.gamesDirectory)
 
   state = {
     settings,
@@ -161,12 +165,28 @@ async function loadState() {
     window: parsed?.window || null,
   }
 
-  await fsp.mkdir(state.settings.gamesDirectory, { recursive: true })
-  await saveStateFile()
+  try {
+    await fsp.mkdir(state.settings.gamesDirectory, { recursive: true })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    state.logs.unshift({
+      id: `startup-${Date.now()}`,
+      type: 'warning',
+      message: `The games folder is unavailable: ${message}`,
+      timestamp: new Date().toISOString(),
+    })
+    state.logs = state.logs.slice(0, 300)
+  }
+
+  try {
+    await saveStateFile()
+  } catch (error) {
+    console.error('Could not save the initial state:', error)
+  }
 }
 
 async function saveStateFile() {
-  if (!statePath) return
+  if (!statePath || !state) return
   const payload = JSON.stringify(
     {
       version: 1,
@@ -178,9 +198,17 @@ async function saveStateFile() {
     null,
     2,
   )
-  const temporary = `${statePath}.tmp`
-  await fsp.writeFile(temporary, payload)
-  await fsp.rename(temporary, statePath)
+
+  saveQueue = saveQueue.catch(() => undefined).then(async () => {
+    const temporary = `${statePath}.${process.pid}.${++saveSequence}.tmp`
+    try {
+      await fsp.writeFile(temporary, payload)
+      await fsp.rename(temporary, statePath)
+    } finally {
+      await fsp.rm(temporary, { force: true }).catch(() => undefined)
+    }
+  })
+  return saveQueue
 }
 
 function broadcast(channel, payload) {
@@ -227,7 +255,7 @@ async function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
       spellcheck: false,
     },
   })
@@ -240,9 +268,18 @@ async function createWindow() {
   })
 
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    const allowed = isDev
-      ? url.startsWith(process.env.VITE_DEV_SERVER_URL)
-      : url.startsWith('file://')
+    let allowed = false
+    try {
+      if (isDev && process.env.VITE_DEV_SERVER_URL) {
+        allowed = new URL(url).origin === new URL(process.env.VITE_DEV_SERVER_URL).origin
+      } else {
+        const target = new URL(url)
+        allowed =
+          target.protocol === 'file:' && target.pathname === new URL(appEntryUrl).pathname
+      }
+    } catch {
+      allowed = false
+    }
     if (!allowed) event.preventDefault()
   })
 
@@ -270,7 +307,7 @@ async function createWindow() {
   if (isDev) {
     await mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
   } else {
-    await mainWindow.loadFile(path.join(projectRoot, 'dist', 'index.html'))
+    await mainWindow.loadFile(appEntryPath)
   }
 
   if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible() && !process.env.QC_SCREENSHOT) {
@@ -453,43 +490,66 @@ if (!app.requestSingleInstanceLock()) {
     }
   })
 
-  app.whenReady().then(async () => {
-    await loadState()
-    applyNativeTheme()
-    setupRunnerService()
-    setupIpc()
-    await createWindow()
+  app
+    .whenReady()
+    .then(async () => {
+      await loadState()
+      applyNativeTheme()
+      setupRunnerService()
+      setupIpc()
+      await createWindow()
 
-    nativeTheme.on('updated', updateTitleBar)
+      nativeTheme.on('updated', updateTitleBar)
 
-    app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      })
     })
-  })
+    .catch((error) => {
+      console.error('Questline failed to start:', error)
+      const message = error instanceof Error ? error.message : String(error)
+      try {
+        dialog.showErrorBox('Questline could not start', message)
+      } catch {
+        // The dialog is best-effort during early startup failures.
+      }
+      app.quit()
+    })
 
   app.on('window-all-closed', () => {
     app.quit()
   })
 
-  app.on('before-quit', async (event) => {
-    if (quittingAfterCleanup || !state) return
+  app.on('before-quit', (event) => {
+    if (cleanupComplete || !state) return
 
-    try {
-      await saveStateFile()
-    } catch {
-      // Best effort.
-    }
+    // This must run synchronously: Electron does not await async listeners.
+    event.preventDefault()
+    if (cleanupStarted) return
+    cleanupStarted = true
 
-    if (state.settings.stopGamesOnQuit && runnerService) {
-      event.preventDefault()
-      quittingAfterCleanup = true
+    void (async () => {
       try {
-        await runnerService.stopAll()
-        await discordRpc.disconnect(true)
+        await saveStateFile()
       } catch {
-        // Continue quitting regardless.
+        // Best effort.
       }
+
+      if (state.settings.stopGamesOnQuit && runnerService) {
+        try {
+          await runnerService.stopAll()
+        } catch {
+          // Continue quitting regardless.
+        }
+        try {
+          await discordRpc.disconnect(true)
+        } catch {
+          // Continue quitting regardless.
+        }
+      }
+
+      cleanupComplete = true
       app.quit()
-    }
+    })()
   })
 }

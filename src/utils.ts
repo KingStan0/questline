@@ -84,6 +84,14 @@ export function splitExecutable(name: string): { folders: string[]; filename: st
   return { folders: parts, filename }
 }
 
+export function canonicalExecutableName(name: string): string {
+  return name.replace(/\//g, '\\').split('\\').filter(Boolean).join('\\').toLowerCase()
+}
+
+export function sessionKeyFor(gameId: string, executableName: string): string {
+  return `${gameId}::${canonicalExecutableName(executableName)}`
+}
+
 export function executableLabel(name: string): string {
   return splitExecutable(name).filename.replace(/\.[^.]+$/, '')
 }
@@ -96,20 +104,28 @@ export function currentPlatform(): string {
 
 export function isUsableExecutable(executable: GameExecutable): boolean {
   if (!executable.name) return false
-  if (/[<>:"|?*]/.test(executable.name.replace(/[\\/]/g, ''))) return false
+  const normalized = executable.name.replace(/\//g, '\\')
+  if (/^[a-zA-Z]:/.test(normalized) || normalized.startsWith('\\')) return false
+  const segments = normalized.split('\\').filter(Boolean)
+  if (!segments.length) return false
+  for (const segment of segments) {
+    if (segment === '.' || segment === '..') return false
+    if (/[<>:"|?*\u0000-\u001f]/.test(segment)) return false
+    if (/[. ]$/.test(segment)) return false
+  }
   return true
 }
 
+export function isExecutableForCurrentPlatform(executable: GameExecutable): boolean {
+  return executable.os === currentPlatform()
+}
+
 export function preferredExecutable(game: Game): GameExecutable | null {
-  const usable = game.executables.filter(isUsableExecutable)
   const platform = currentPlatform()
-  return (
-    usable.find((entry) => entry.os === platform && !entry.is_launcher) ||
-    usable.find((entry) => entry.os === platform) ||
-    usable.find((entry) => entry.os === 'win32' && !entry.is_launcher) ||
-    usable[0] ||
-    null
+  const usable = game.executables.filter(
+    (entry) => isUsableExecutable(entry) && isExecutableForCurrentPlatform(entry),
   )
+  return usable.find((entry) => !entry.is_launcher) || usable[0] || null
 }
 
 export function normalizePlatform(os: string): string {

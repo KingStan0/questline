@@ -55,15 +55,15 @@ static void update_status(void) {
     if (g_status == NULL || g_started_at == 0) return;
 
     ULONGLONG elapsed = (GetTickCount64() - g_started_at) / 1000ULL;
-    unsigned long long hours = elapsed / 3600ULL;
-    unsigned long long minutes = (elapsed % 3600ULL) / 60ULL;
-    unsigned long long seconds = elapsed % 60ULL;
+    unsigned long hours = (unsigned long)(elapsed / 3600ULL);
+    unsigned long minutes = (unsigned long)((elapsed % 3600ULL) / 60ULL);
+    unsigned long seconds = (unsigned long)(elapsed % 60ULL);
     WCHAR buffer[96];
 
     if (hours > 0) {
-        wsprintfW(buffer, L"Running for %llu:%02llu:%02llu", hours, minutes, seconds);
+        wsprintfW(buffer, L"Running for %lu:%02lu:%02lu", hours, minutes, seconds);
     } else {
-        wsprintfW(buffer, L"Running for %02llu:%02llu", minutes, seconds);
+        wsprintfW(buffer, L"Running for %02lu:%02lu", minutes, seconds);
     }
     SetWindowTextW(g_status, buffer);
 }
