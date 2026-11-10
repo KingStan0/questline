@@ -89,13 +89,13 @@ async function stopAll() {
         <button
           class="btn btn-sm btn-danger session-stop"
           type="button"
-          :disabled="stoppingKey === `${entry.session.gameId}::${entry.session.executableName}`"
+          :disabled="stoppingKey === entry.session.key"
           @click="stop(entry.session)"
         >
           <Icon
-            :name="stoppingKey === `${entry.session.gameId}::${entry.session.executableName}` ? 'refresh' : 'stop'"
+            :name="stoppingKey === entry.session.key ? 'refresh' : 'stop'"
             :size="12"
-            :class="{ spin: stoppingKey === `${entry.session.gameId}::${entry.session.executableName}` }"
+            :class="{ spin: stoppingKey === entry.session.key }"
           />
           Stop
         </button>

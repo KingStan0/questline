@@ -45,9 +45,14 @@ if (-not $root) {
   Write-Output '[]'
   exit 0
 }
+$root = $root.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
 $result = Get-CimInstance Win32_Process | Where-Object {
   $exe = $_.ExecutablePath
-  $exe -and $exe.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)
+  if (-not $exe) { return $false }
+  if (-not $exe.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+  $relative = $exe.Substring($root.Length)
+  $separator = $relative.IndexOf([System.IO.Path]::DirectorySeparatorChar)
+  $separator -gt 0 -and $relative.Substring(0, $separator) -match '^[0-9]{1,25}$'
 } | ForEach-Object {
   [PSCustomObject]@{
     ProcessId = [int]$_.ProcessId
@@ -65,14 +70,21 @@ if (-not $root) {
   Write-Output '0'
   exit 0
 }
+$root = $root.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
 $targets = Get-CimInstance Win32_Process | Where-Object {
   $exe = $_.ExecutablePath
-  $exe -and $exe.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)
+  if (-not $exe) { return $false }
+  if (-not $exe.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+  $relative = $exe.Substring($root.Length)
+  $separator = $relative.IndexOf([System.IO.Path]::DirectorySeparatorChar)
+  $separator -gt 0 -and $relative.Substring(0, $separator) -match '^[0-9]{1,25}$'
 }
 $count = 0
 foreach ($target in @($targets)) {
-  Stop-Process -Id $target.ProcessId -Force -ErrorAction SilentlyContinue
-  $count++
+  try {
+    Stop-Process -Id $target.ProcessId -Force -ErrorAction Stop
+    $count++
+  } catch {}
 }
 Write-Output ([string]$count)
 `
@@ -93,10 +105,32 @@ $targets = Get-CimInstance Win32_Process | Where-Object {
 }
 $count = 0
 foreach ($target in @($targets)) {
-  Stop-Process -Id $target.ProcessId -Force -ErrorAction SilentlyContinue
-  $count++
+  try {
+    Stop-Process -Id $target.ProcessId -Force -ErrorAction Stop
+    $count++
+  } catch {}
 }
 Write-Output ([string]$count)
+`
+
+const PROCESS_BY_PID = `
+$ErrorActionPreference = 'SilentlyContinue'
+$processId = [int]$env:QUESTLINE_PID
+if ($processId -le 0) {
+  Write-Output '[]'
+  exit 0
+}
+$process = Get-CimInstance Win32_Process -Filter "ProcessId = $processId"
+if (-not $process -or -not $process.ExecutablePath) {
+  Write-Output '[]'
+  exit 0
+}
+$result = [PSCustomObject]@{
+  ProcessId = [int]$process.ProcessId
+  Path = [string]$process.ExecutablePath
+  StartedAt = if ($process.CreationDate) { $process.CreationDate.ToUniversalTime().ToString('o') } else { $null }
+}
+Write-Output (ConvertTo-Json -InputObject @($result) -Compress)
 `
 
 function isValidGameId(gameId) {
@@ -135,6 +169,34 @@ function splitExecutableName(executableName) {
 
 function pathKey(filePath) {
   return path.resolve(filePath).toLowerCase()
+}
+
+function canonicalExecutableName(executableName) {
+  return String(executableName)
+    .replace(/\//g, '\\')
+    .split('\\')
+    .filter(Boolean)
+    .join('\\')
+    .toLowerCase()
+}
+
+const RUNNER_SIGNATURE = Buffer.from('QuestlineRunnerWindow', 'utf16le')
+
+async function isQuestlineRunner(filePath) {
+  try {
+    const handle = await fs.open(filePath, 'r')
+    try {
+      const { size } = await handle.stat()
+      if (size <= 0 || size > 32 * 1024 * 1024) return false
+      const buffer = Buffer.alloc(size)
+      await handle.read(buffer, 0, size, 0)
+      return buffer.includes(RUNNER_SIGNATURE)
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return false
+  }
 }
 
 async function runPowerShell(script, environment = {}) {
@@ -181,7 +243,7 @@ export class RunnerService {
   }
 
   sessionKey(gameId, executableName) {
-    return `${gameId}::${executableName.toLowerCase()}`
+    return `${gameId}::${canonicalExecutableName(executableName)}`
   }
 
   targetFor(gameId, executableName) {
@@ -193,7 +255,12 @@ export class RunnerService {
     const folder = path.resolve(this.gamesDirectory, gameId, ...segments)
     const target = path.resolve(folder, filename)
     const relative = path.relative(path.resolve(this.gamesDirectory), target)
-    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    if (
+      !relative ||
+      relative === '..' ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative)
+    ) {
       throw new Error('The executable path escapes the games folder.')
     }
     return { target, folder, filename, executableName }
@@ -211,19 +278,22 @@ export class RunnerService {
   async inspectMany(games) {
     if (!Array.isArray(games)) throw new Error('Missing game data.')
 
-    const groups = games.map((game) => {
-      if (!game || !isValidGameId(String(game.gameId))) {
-        throw new Error('The game id is invalid.')
-      }
+    const groups = []
+    for (const game of games) {
+      if (!game || !isValidGameId(String(game.gameId))) continue
       const gameId = String(game.gameId)
-      const rows = (Array.isArray(game.executables) ? game.executables : [])
-        .filter((entry) => entry && typeof entry.name === 'string')
-        .map((entry) => {
+      const rows = []
+      for (const entry of Array.isArray(game.executables) ? game.executables : []) {
+        if (!entry || typeof entry.name !== 'string') continue
+        try {
           const { target } = this.targetFor(gameId, entry.name)
-          return { executable: entry.name, os: entry.os, target }
-        })
-      return { gameId, rows }
-    })
+          rows.push({ executable: entry.name, os: entry.os, target })
+        } catch {
+          // A malformed catalog entry should not hide the status of every other game.
+        }
+      }
+      groups.push({ gameId, rows })
+    }
 
     const allPaths = groups.flatMap((group) => group.rows.map((row) => row.target))
     const processes = await this.findProcessesByPaths(allPaths)
@@ -258,6 +328,14 @@ export class RunnerService {
     }
 
     await fs.mkdir(folder, { recursive: true })
+
+    // Never replace a real game file. Runners copied by Questline carry a
+    // recognizable window-class signature, so upgrades can still overwrite them.
+    if (existsSync(target) && !(await isQuestlineRunner(target))) {
+      throw new Error(
+        `Refusing to replace an existing file that was not created by Questline: ${target}`,
+      )
+    }
 
     // Never overwrite a runner that is currently in use. Windows would reject
     // the write anyway, but returning a useful message is friendlier.
@@ -354,7 +432,12 @@ export class RunnerService {
 
     const session = this.forget(gameId, executableName)
     if (stopped === 0 && session) {
-      if (await this.killPid(session.pid)) stopped++
+      // The path query can fail while the process is still alive. Verify the
+      // PID still points at the expected runner before using the fallback.
+      const current = await this.findProcessById(session.pid)
+      if (current && pathKey(current.path) === pathKey(target)) {
+        if (await this.killPid(session.pid)) stopped++
+      }
     }
 
     return { stopped }
@@ -363,20 +446,43 @@ export class RunnerService {
   async stopAll() {
     await this.ensureRoot()
     let stopped = 0
-    try {
-      const output = await runPowerShell(KILL_ROOT, {
-        QUESTLINE_ROOT: this.gamesDirectory,
-      })
-      stopped = Number.parseInt(output, 10) || 0
-    } catch {
-      // Fall back to the sessions we know about.
-      for (const session of [...this.sessions.values()]) {
-        if (await this.killPid(session.pid)) stopped++
+    let broadStopCompleted = false
+
+    // A drive root would otherwise match nearly every process on the drive.
+    if (!this.isFilesystemRoot()) {
+      try {
+        const output = await runPowerShell(KILL_ROOT, {
+          QUESTLINE_ROOT: this.gamesDirectory,
+        })
+        stopped = Number.parseInt(output, 10) || 0
+        broadStopCompleted = true
+      } catch {
+        // Fall back to the sessions we know about.
       }
     }
 
-    const ended = [...this.sessions.values()]
-    this.sessions.clear()
+    if (!broadStopCompleted) {
+      for (const session of [...this.sessions.values()]) {
+        const current = await this.findProcessById(session.pid)
+        if (
+          current &&
+          pathKey(current.path) === pathKey(session.path) &&
+          (await this.killPid(session.pid))
+        ) {
+          stopped++
+        }
+      }
+    }
+
+    const live = await this.listRunning().catch(() => null)
+    const livePaths = live ? new Set(live.map((entry) => pathKey(entry.path))) : null
+    const ended = []
+    for (const [key, session] of [...this.sessions.entries()]) {
+      if (!livePaths || !livePaths.has(pathKey(session.path))) {
+        this.sessions.delete(key)
+        ended.push(session)
+      }
+    }
     for (const session of ended) {
       this.onEvent({ type: 'ended', session })
     }
@@ -405,7 +511,14 @@ export class RunnerService {
 
     for (const process of processes) {
       const relative = path.relative(root, process.path)
-      if (!relative || relative.startsWith('..')) continue
+      if (
+        !relative ||
+        relative === '..' ||
+        relative.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(relative)
+      ) {
+        continue
+      }
       const segments = relative.split(path.sep)
       if (segments.length < 2) continue
       const gameId = segments[0]
@@ -435,6 +548,22 @@ export class RunnerService {
     } catch {
       return []
     }
+  }
+
+  async findProcessById(pid) {
+    if (!Number.isInteger(pid) || pid <= 0) return null
+    try {
+      const output = await runPowerShell(PROCESS_BY_PID, {
+        QUESTLINE_PID: String(pid),
+      })
+      return parseProcessList(output)[0] || null
+    } catch {
+      return null
+    }
+  }
+
+  isFilesystemRoot() {
+    return path.parse(this.gamesDirectory).root.toLowerCase() === this.gamesDirectory.toLowerCase()
   }
 
   async killPid(pid) {

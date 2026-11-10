@@ -45,13 +45,20 @@ export function normalizeGameList(input) {
 }
 
 export function isValidGameList(input) {
-  return (
-    Array.isArray(input) &&
-    input.length > 1000 &&
-    input[0] &&
-    typeof input[0].name === 'string' &&
-    Array.isArray(input[0].executables)
-  )
+  if (!Array.isArray(input) || input.length <= 1000) return false
+
+  const ids = new Set()
+  for (const game of input) {
+    if (!game || typeof game !== 'object') return false
+    if (typeof game.name !== 'string' || !game.name.trim()) return false
+    if (!Array.isArray(game.executables)) return false
+    if (typeof game.id !== 'string' && typeof game.id !== 'number') return false
+    const id = String(game.id)
+    if (!/^\d{1,25}$/.test(id) || ids.has(id)) return false
+    ids.add(id)
+  }
+
+  return true
 }
 
 async function readJson(file) {
@@ -128,7 +135,7 @@ export async function refreshGameData({ cachePath, onProgress = () => {} }) {
         games,
       }
       await fs.mkdir(cachePath.replace(/[\\/][^\\/]+$/, ''), { recursive: true })
-      const temporary = `${cachePath}.tmp`
+      const temporary = `${cachePath}.${process.pid}.${Date.now()}.tmp`
       await fs.writeFile(temporary, JSON.stringify(payload))
       await fs.rename(temporary, cachePath)
       onProgress(`${games.length.toLocaleString()} games synced.`)
